@@ -1,6 +1,7 @@
 pipecat-ai[daily,cartesia,openai,google,silero]
-fastapi==3.11.12
+fastapi
 uvicorn
 python-dotenv
 twilio
 python-multipart
+debugpy

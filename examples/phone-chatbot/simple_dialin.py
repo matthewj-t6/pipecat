@@ -7,6 +7,9 @@ import argparse
 import asyncio
 import os
 import sys
+import debugpy
+debugpy.listen(5678)
+debugpy.wait_for_client()
 
 from call_connection_manager import CallConfigManager, SessionManager
 from dotenv import load_dotenv
@@ -24,6 +27,8 @@ from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.cartesia.tts import CartesiaTTSService
 from pipecat.services.llm_service import LLMService
 from pipecat.services.openai.llm import OpenAILLMService
+from pipecat.services.openai.stt import OpenAISTTService
+from pipecat.services.openai.tts import OpenAITTSService
 from pipecat.transports.services.daily import DailyDialinSettings, DailyParams, DailyTransport
 
 load_dotenv(override=True)
@@ -67,7 +72,8 @@ async def main(
             camera_out_enabled=False,
             vad_enabled=True,
             vad_analyzer=SileroVADAnalyzer(),
-            transcription_enabled=True,
+            vad_audio_passthrough=True,
+            transcription_enabled=False,
         )
     else:
         daily_dialin_settings = DailyDialinSettings(
@@ -82,7 +88,8 @@ async def main(
             camera_out_enabled=False,
             vad_enabled=True,
             vad_analyzer=SileroVADAnalyzer(),
-            transcription_enabled=True,
+            vad_audio_passthrough=True,
+            transcription_enabled=False,
         )
 
     # Initialize transport with Daily
@@ -93,10 +100,16 @@ async def main(
         transport_params,
     )
 
+    # Initialize STT
+    stt = OpenAISTTService(
+        api_key=os.getenv("OPENAI_API_KEY"),
+        model="gpt-4o-mini-transcribe",
+    )
+
     # Initialize TTS
-    tts = CartesiaTTSService(
-        api_key=os.getenv("CARTESIA_API_KEY", ""),
-        voice_id="b7d50908-b17c-442d-ad8d-810c63997ed9",  # Use Helpful Woman voice by default
+    tts = OpenAITTSService(
+        api_key=os.getenv("OPENAI_API_KEY"),
+        model="gpt-4o-mini-tts",
     )
 
     # ------------ FUNCTION DEFINITIONS ------------
@@ -129,7 +142,7 @@ async def main(
     system_instruction = """You are Chatbot, a friendly, helpful robot. Your goal is to demonstrate your capabilities in a succinct way. Your output will be converted to audio so don't include special characters in your answers. Respond to what the user said in a creative and helpful way, but keep your responses brief. Start by introducing yourself. If the user ends the conversation, **IMMEDIATELY** call the `terminate_call` function. """
 
     # Initialize LLM
-    llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"), model="gpt-4o")
+    llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"), model="gpt-4o-mini-2024-07-18")
 
     # Register functions with the LLM
     llm.register_function("terminate_call", terminate_call)
@@ -147,6 +160,7 @@ async def main(
     pipeline = Pipeline(
         [
             transport.input(),  # Transport user input
+            stt,  # STT
             context_aggregator.user(),  # User responses
             llm,  # LLM
             tts,  # TTS
@@ -163,7 +177,6 @@ async def main(
     @transport.event_handler("on_first_participant_joined")
     async def on_first_participant_joined(transport, participant):
         logger.debug(f"First participant joined: {participant['id']}")
-        await transport.capture_participant_transcription(participant["id"])
         await task.queue_frames([context_aggregator.user().get_context_frame()])
 
     @transport.event_handler("on_participant_left")
