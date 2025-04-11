@@ -18,13 +18,17 @@ from loguru import logger
 from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from pipecat.audio.vad.silero import SileroVADAnalyzer
-from pipecat.frames.frames import EndTaskFrame
+from pipecat.frames.frames import (
+    Frame,
+    LLMMessagesFrame,
+    TranscriptionFrame,
+)
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
-from pipecat.processors.frame_processor import FrameDirection
-from pipecat.services.cartesia.tts import CartesiaTTSService
+from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
+from pipecat.processors.frameworks.rtvi import RTVIObserver, RTVIProcessor
 from pipecat.services.llm_service import LLMService
 from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.services.openai.stt import OpenAISTTService
@@ -39,6 +43,42 @@ logger.add(sys.stderr, level="DEBUG")
 daily_api_key = os.getenv("DAILY_API_KEY", "")
 daily_api_url = os.getenv("DAILY_API_URL", "https://api.daily.co/v1")
 
+class TranslationProcessor(FrameProcessor):
+    """A processor that translates text frames from a source language to a target language."""
+
+    def __init__(self, in_language, out_language):
+        """Initialize the TranslationProcessor with source and target languages.
+
+        Args:
+            in_language (str): The language of the input text.
+            out_language (str): The language to translate the text into.
+        """
+        super().__init__()
+        self._out_language = out_language
+        self._in_language = in_language
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        """Process a frame and translate text frames.
+
+        Args:
+            frame (Frame): The frame to process.
+            direction (FrameDirection): The direction of the frame.
+        """
+        await super().process_frame(frame, direction)
+
+        if isinstance(frame, TranscriptionFrame):
+            logger.debug(f"Translating {self._in_language}: {frame.text} to {self._out_language}")
+            context = [
+                {
+                    "role": "system",
+                    "content": f"You will be provided with a sentence in {self._in_language}, and your task is to only translate it into {self._out_language}.",
+                },
+                {"role": "user", "content": frame.text},
+            ]
+            await self.push_frame(LLMMessagesFrame(context))
+        else:
+            await self.push_frame(frame)
+
 
 async def main(
     room_url: str,
@@ -50,9 +90,6 @@ async def main(
     # Create a config manager using the provided body
     call_config_manager = CallConfigManager.from_json_string(body) if body else CallConfigManager()
 
-    # Get important configuration values
-    test_mode = call_config_manager.is_test_mode()
-
     # Get dialin settings if present
     dialin_settings = call_config_manager.get_dialin_settings()
 
@@ -61,36 +98,21 @@ async def main(
 
     # ------------ TRANSPORT SETUP ------------
 
-    # Set up transport parameters
-    if test_mode:
-        logger.info("Running in test mode")
-        transport_params = DailyParams(
-            api_url=daily_api_url,
-            api_key=daily_api_key,
-            audio_in_enabled=True,
-            audio_out_enabled=True,
-            camera_out_enabled=False,
-            vad_enabled=True,
-            vad_analyzer=SileroVADAnalyzer(),
-            vad_audio_passthrough=True,
-            transcription_enabled=False,
-        )
-    else:
-        daily_dialin_settings = DailyDialinSettings(
-            call_id=dialin_settings.get("call_id"), call_domain=dialin_settings.get("call_domain")
-        )
-        transport_params = DailyParams(
-            api_url=daily_api_url,
-            api_key=daily_api_key,
-            dialin_settings=daily_dialin_settings,
-            audio_in_enabled=True,
-            audio_out_enabled=True,
-            camera_out_enabled=False,
-            vad_enabled=True,
-            vad_analyzer=SileroVADAnalyzer(),
-            vad_audio_passthrough=True,
-            transcription_enabled=False,
-        )
+    daily_dialin_settings = DailyDialinSettings(
+        call_id=dialin_settings.get("call_id"), call_domain=dialin_settings.get("call_domain")
+    )
+    transport_params = DailyParams(
+        api_url=daily_api_url,
+        api_key=daily_api_key,
+        dialin_settings=daily_dialin_settings,
+        audio_in_enabled=True,
+        audio_out_enabled=True,
+        camera_out_enabled=False,
+        vad_enabled=True,
+        vad_analyzer=SileroVADAnalyzer(),
+        vad_audio_passthrough=True,
+        transcription_enabled=False,
+    )
 
     # Initialize transport with Daily
     transport = DailyTransport(
@@ -112,72 +134,49 @@ async def main(
         model="gpt-4o-mini-tts",
     )
 
-    # ------------ FUNCTION DEFINITIONS ------------
-
-    async def terminate_call(
-        function_name, tool_call_id, args, llm: LLMService, context, result_callback
-    ):
-        """Function the bot can call to terminate the call upon completion of a voicemail message."""
-        if session_manager:
-            # Mark that the call was terminated by the bot
-            session_manager.call_flow_state.set_call_terminated()
-
-        # Then end the call
-        await llm.queue_frame(EndTaskFrame(), FrameDirection.UPSTREAM)
-
-    # Define function schemas for tools
-    terminate_call_function = FunctionSchema(
-        name="terminate_call",
-        description="Call this function to terminate the call.",
-        properties={},
-        required=[],
-    )
-
-    # Create tools schema
-    tools = ToolsSchema(standard_tools=[terminate_call_function])
-
     # ------------ LLM AND CONTEXT SETUP ------------
-
-    # Set up the system instruction for the LLM
-    system_instruction = """You are Chatbot, a friendly, helpful robot. Your goal is to demonstrate your capabilities in a succinct way. Your output will be converted to audio so don't include special characters in your answers. Respond to what the user said in a creative and helpful way, but keep your responses brief. Start by introducing yourself. If the user ends the conversation, **IMMEDIATELY** call the `terminate_call` function. """
 
     # Initialize LLM
     llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"), model="gpt-4o-mini-2024-07-18")
 
-    # Register functions with the LLM
-    llm.register_function("terminate_call", terminate_call)
-
-    # Create system message and initialize messages list
-    messages = [call_config_manager.create_system_message(system_instruction)]
-
     # Initialize LLM context and aggregator
-    context = OpenAILLMContext(messages, tools)
-    context_aggregator = llm.create_context_aggregator(context)
+    # context = OpenAILLMContext()
+    # context_aggregator = llm.create_context_aggregator(context)
 
     # ------------ PIPELINE SETUP ------------
 
-    # Build pipeline
+    in_language = "English"
+    out_language = "Spanish"
+
+    tp = TranslationProcessor(in_language=in_language, out_language=out_language)
+
+    rtvi = RTVIProcessor()
+
     pipeline = Pipeline(
         [
-            transport.input(),  # Transport user input
-            stt,  # STT
-            context_aggregator.user(),  # User responses
-            llm,  # LLM
-            tts,  # TTS
-            transport.output(),  # Transport bot output
-            context_aggregator.assistant(),  # Assistant spoken responses
+            transport.input(),
+            rtvi,
+            stt,
+            tp,
+            llm,
+            tts,
+            transport.output(),
         ]
     )
 
-    # Create pipeline task
-    task = PipelineTask(pipeline, params=PipelineParams(allow_interruptions=True))
-
+    task = PipelineTask(
+        pipeline,
+        params=PipelineParams(
+            allow_interruptions=False,  # We don't want to interrupt the translator bot
+        ),
+        observers=[RTVIObserver(rtvi)],
+    )
+    
     # ------------ EVENT HANDLERS ------------
 
-    @transport.event_handler("on_first_participant_joined")
-    async def on_first_participant_joined(transport, participant):
-        logger.debug(f"First participant joined: {participant['id']}")
-        await task.queue_frames([context_aggregator.user().get_context_frame()])
+    @transport.event_handler("on_participant_joined")
+    async def on_participant_joined(transport, participant):
+        logger.debug(f"participant joined: {participant['id']}")
 
     @transport.event_handler("on_participant_left")
     async def on_participant_left(transport, participant, reason):
@@ -185,9 +184,6 @@ async def main(
         await task.cancel()
 
     # ------------ RUN PIPELINE ------------
-
-    if test_mode:
-        logger.debug("Running in test mode (can be tested in Daily Prebuilt)")
 
     runner = PipelineRunner()
     await runner.run(task)
